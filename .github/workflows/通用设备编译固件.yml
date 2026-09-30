@@ -1,5 +1,5 @@
 #============================================================================================
-# Description: Build OpenWrt for MT7628 Router (Fixed Environment Cleanup & Node24 Release)
+# Description: Pure OpenWrt Build Workflow for MT7628 Routers (No external scripts dependency)
 #============================================================================================
 
 name: 通用设备编译固件
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       source_branch:
-        description: "Select the source branch"
+        description: "选择编译源码分支"
         required: false
         default: "immortalwrt-master"
         type: choice
@@ -17,16 +17,9 @@ on:
           - openwrt-main
           - lede-master
           - immortalwrt-master
-          - Lienol-master
       
 env:
-  FEEDS_CONF: config/${{ inputs.source_branch }}/feeds.conf.default
   CONFIG_FILE: config/${{ inputs.source_branch }}/config
-  DIY_P1_SH: config/${{ inputs.source_branch }}/diy-part1.sh
-  DIY_P2_SH: config/${{ inputs.source_branch }}/diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
@@ -38,20 +31,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Initialization environment
+      - name: 安装编译依赖
         id: init
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo -E apt-get -y update
           sudo -E apt-get -y install $(curl -fsSL https://is.gd)
-          sudo -E systemctl daemon-reload
           sudo mkdir -p /workdir
           sudo chown ${USER}:${GROUPS} /workdir
           sudo timedatectl set-timezone "${TZ}"
           echo "status=success" >> $GITHUB_OUTPUT
 
-      - name: Clone source code [ ${{ inputs.source_branch }} ]
+      - name: 克隆官方源码
         id: codes
         working-directory: /workdir
         if: steps.init.outputs.status == 'success' && !cancelled()
@@ -59,93 +51,71 @@ jobs:
           if [[ "${{ inputs.source_branch }}" == *"openwrt"* ]]; then
               REPO_URL="https://github.com"
               REPO_BRANCH="main"
-              TAGS_NAME="official"
           elif [[ "${{ inputs.source_branch }}" == *"lede"* ]]; then
               REPO_URL="https://github.com"
               REPO_BRANCH="master"
-              TAGS_NAME="lede"
           elif [[ "${{ inputs.source_branch }}" == *"immortalwrt"* ]]; then
               REPO_URL="https://github.com"
               REPO_BRANCH="master"
-              TAGS_NAME="immortalwrt"
-          elif [[ "${{ inputs.source_branch }}" == *"Lienol"* ]]; then
-              REPO_URL="https://github.com"
-              REPO_BRANCH="22.03"
-              TAGS_NAME="Lienol"
+          fi
+          git clone -q --single-branch --depth=1 --branch=${REPO_BRANCH} ${REPO_URL} openwrt
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: 更新并安装扩展包 (Feeds)
+        working-directory: /workdir/openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 载入你的路由器配置文件
+        working-directory: /workdir/openwrt
+        run: |
+          if [[ -f "${GITHUB_WORKSPACE}/${CONFIG_FILE}" ]]; then
+              cp -f ${GITHUB_WORKSPACE}/${CONFIG_FILE} .config
           else
-              echo "Unknown source code repository."
+              echo "警告: 未在当前仓库的 ${CONFIG_FILE} 路径下找到种子配置文件！"
+          fi
+
+      - name: 下载编译缓存包 (Download)
+        working-directory: /workdir/openwrt
+        run: |
+          make defconfig
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: 开始核心编译 (Compile)
+        working-directory: /workdir/openwrt
+        run: |
+          echo "$(nproc) 线程编译中..."
+          make -j$(($(nproc) + 1)) V=s || make -j1 || make -j1 V=s
+
+      - name: 提取编译出的路由器二进制固件
+        id: organize
+        run: |
+          mkdir -p ${GITHUB_WORKSPACE}/firmware_out
+          if [ -d "/workdir/openwrt/bin/targets" ]; then
+              find /workdir/openwrt/bin/targets/ -type f \( -name "*.bin" -o -name "*.trx" \) -exec cp -f {} ${GITHUB_WORKSPACE}/firmware_out/ \;
+              echo "status=success" >> $GITHUB_OUTPUT
+          else
+              echo "错误: 未找到任何编译输出目录！"
               exit 1
           fi
 
-          git clone -q --single-branch --depth=1 --branch=${REPO_BRANCH} ${REPO_URL} openwrt
-          ln -sf /workdir/openwrt ${GITHUB_WORKSPACE}/openwrt
-          echo "status=success" >> $GITHUB_OUTPUT
-
-      - name: Load custom feeds
-        run: |
-          [[ -f "${FEEDS_CONF}" ]] && cp -f ${FEEDS_CONF} openwrt/feeds.conf.default
-          [[ -f "${DIY_P1_SH}" ]] && chmod +x ${DIY_P1_SH} && cd openwrt/ && ${GITHUB_WORKSPACE}/${DIY_P1_SH} || true
-
-      - name: Update feeds
-        run: cd openwrt/ && ./scripts/feeds update -a
-
-      - name: Install feeds
-        run: cd openwrt/ && ./scripts/feeds install -a
-
-      - name: Load custom configuration
-        run: |
-          [[ -d "files" ]] && mv -f files openwrt/files
-          [[ -e "${CONFIG_FILE}" ]] && cp -f ${CONFIG_FILE} openwrt/.config
-          [[ -f "${DIY_P2_SH}" ]] && chmod +x ${DIY_P2_SH} && cd openwrt/ && ${GITHUB_WORKSPACE}/${DIY_P2_SH} || true
-
-      - name: Download package
-        id: package
-        run: |
-          cd openwrt/
-          make defconfig
-          make download -j8
-          find dl -size -1024c -exec ls -l {} \;
-          find dl -size -1024c -exec rm -f {} \;
-
-      - name: Compile the OpenWrt
-        id: compile
-        run: |
-          cd openwrt/
-          echo "$(nproc) thread compile"
-          make -j$(($(nproc) + 1)) V=s || make -j1 || make -j1 V=s
-          echo "status=success" >> $GITHUB_OUTPUT
-
-      - name: Organize files
-        id: organize
-        if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-        run: |
-          mkdir -p ${GITHUB_WORKSPACE}/firmware_out
-          cd openwrt/bin/targets/
-          find . -type f \( -name "*.bin" -o -name "*.trx" \) -exec cp -f {} ${GITHUB_WORKSPACE}/firmware_out/ \;
-          echo "FIRMWARE_DIR=${GITHUB_WORKSPACE}/firmware_out" >> $GITHUB_ENV
-          echo "status=success" >> $GITHUB_OUTPUT
-
-      - name: Upload firmware directory to Artifacts
+      - name: 上传固件至 GitHub Artifacts (网页底部下载)
         uses: actions/upload-artifact@v4
         if: steps.organize.outputs.status == 'success' && !cancelled()
         with:
-          name: OpenWrt_FIRMWARE
-          path: ${{ env.FIRMWARE_DIR }}
+          name: OpenWrt_MT7628_Firmware
+          path: ${< {GITHUB_WORKSPACE} >}/firmware_out/*
 
-      - name: Generate release tag
-        id: tag
-        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-        run: |
-          echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-          echo "固件编译完成。MT7628 路由器默认网关通常为 192.168.1.1。" > release.txt
-          echo "status=success" >> $GITHUB_OUTPUT
-
-      - name: Upload firmware to GitHub Release
+      - name: 发布至 GitHub Release (发布页面下载)
         uses: softprops/action-gh-release@v2
-        if: steps.tag.outputs.status == 'success' && !cancelled()
+        if: steps.organize.outputs.status == 'success' && !cancelled()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.tag.outputs.release_tag }}
-          body_path: release.txt
-          files: ${{ env.FIRMWARE_DIR }}/*
+          tag_name: MT7628-OpenWrt-${{ github.run_id }}
+          body: |
+            MT7628NN (R101i) 路由器固件编译成功！
+            默认后台网关通常为 192.168.1.1
+          files: ${< {GITHUB_WORKSPACE} >}/firmware_out/*
